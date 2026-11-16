@@ -21,7 +21,7 @@ flowchart TD
 
 - An AWS account or course lab with access to S3, Lambda, Step Functions, API Gateway, EventBridge, and IAM.
 - A Linux x86_64 Pillow layer for Python 3.15. The version is pinned in [requirements.txt](requirements.txt).
-- AWS CloudShell or AWS CLI v2 for the commands below. The API test uses a SigV4 client such as Postman.
+- AWS CloudShell for testing the deployed API with a signed request.
 - A JPEG larger than 200 pixels on at least one side for the resize demo.
 
 | Resource | Value |
@@ -32,8 +32,9 @@ flowchart TD
 | Lambda | capstone-resize-image |
 | State machine | capstone-image-workflow |
 | State machine ARN | arn:aws:states:us-east-1:213449029907:stateMachine:capstone-image-workflow |
-| HTTP API | capstone-image-api |
-| API endpoint | Copy the Invoke URL from the $default stage and append /resize. Record the deployed URL here after testing. |
+| Regional REST API | `capstone-image-rest-api` |
+| Deployed stage | `dev` |
+| API endpoint | `https://5e4gedtlg4.execute-api.us-east-1.amazonaws.com/dev/resize` |
 
 ## 1. Deploy the Lambda function
 
@@ -67,36 +68,40 @@ A successful execution follows ResizeImage → ResizeSuccessful → ImageProcess
 
 ## 3. Connect API Gateway
 
-1. Create or open the HTTP API capstone-image-api. Create a POST /resize route and a $default stage with auto-deploy enabled.
-2. Create an IAM role named capstone-api-start-workflow-role trusted by apigateway.amazonaws.com. Grant states:StartExecution on the state machine ARN above. Copy the role ARN.
-3. Attach a StepFunctions-StartExecution integration to the route. Set StateMachineArn to the workflow ARN and Input to $request.body. Set the route authorization to AWS_IAM.
+1. Create a Regional **REST API** named `capstone-image-rest-api` in N. Virginia. Create the `/resize` resource under `/`, then add a `POST` method to it.
+2. Use an **AWS service** integration. Choose `us-east-1` and **Step Functions**, leave the subdomain blank, and set the integration HTTP method to `POST`. Select **Use action name** and enter `StartExecution`.
+3. Use the ARN of `capstone-api-start-workflow-role` as the integration execution role. Its trust policy allows `apigateway.amazonaws.com` to assume it. Its permissions allow `states:StartExecution` on `capstone-image-workflow`.
+4. In **Integration request → Edit**, set **Request body passthrough** to **Never** and add an `application/json` mapping template. It sends the workflow ARN and passes the request body as a JSON string.
 
-If the HTTP API console does not offer the Step Functions integration, use the following in CloudShell. Set API_ID from the API overview and ROLE_ARN from IAM, then run the block. It attaches the integration only to the capstone route. Run once if the route is unattached.
-
-```bash
-export AWS_DEFAULT_REGION=us-east-1
-API_ID='PASTE_API_ID'
-ROLE_ARN='PASTE_API_GATEWAY_ROLE_ARN'
-STATE_ARN='arn:aws:states:us-east-1:213449029907:stateMachine:capstone-image-workflow'
-
-ROUTE_ID=$(aws apigatewayv2 get-routes --api-id "$API_ID" \
-  --query 'Items[?RouteKey==\`POST /resize\`].RouteId | [0]' --output text)
-if [ -z "$ROUTE_ID" ] || [ "$ROUTE_ID" = 'None' ]; then
-  echo 'Create the POST /resize route first.'
-else
-  PARAMS=$(jq -nc --arg arn "$STATE_ARN" '{StateMachineArn:$arn,Input:"$request.body"}')
-  INTEGRATION_ID=$(aws apigatewayv2 create-integration --api-id "$API_ID" \
-    --integration-type AWS_PROXY --integration-subtype StepFunctions-StartExecution \
-    --payload-format-version 1.0 --credentials-arn "$ROLE_ARN" \
-    --request-parameters "$PARAMS" --query IntegrationId --output text) &&
-  aws apigatewayv2 update-route --api-id "$API_ID" --route-id "$ROUTE_ID" \
-    --target "integrations/$INTEGRATION_ID" --authorization-type AWS_IAM
-fi
+```vtl
+{
+  "stateMachineArn": "arn:aws:states:us-east-1:213449029907:stateMachine:capstone-image-workflow",
+  "input": "$util.escapeJavaScript($input.json('$')).replaceAll("\\'","'")"
+}
 ```
 
-Send a POST request in Postman to the $default Invoke URL plus /resize. Choose raw JSON for the body and reuse the sample.jpg input above. Under Authorization select AWS Signature, use authorized AWS credentials, region us-east-1, and service name execute-api. If using temporary credentials, also supply the session token. The caller needs execute-api:Invoke for the route. Keep credentials out of the recording.
+5. In **Method request**, set authorization to `AWS_IAM`. Deploy the API to a stage named `dev`. The identity testing the deployed endpoint needs `execute-api:Invoke` for `POST /dev/resize`.
 
-A successful API call returns an executionArn. Open that execution in Step Functions, confirm its status is Succeeded, and inspect the output key. An execution ARN confirms the request launched the workflow.
+### Test the deployed API
+
+Open AWS CloudShell in N. Virginia and run the command below. It signs the request with your current AWS session. If you redeploy to a different API, replace the URL with your stage's Invoke URL followed by `/resize`.
+
+```bash
+aws configure export-credentials --format process |
+  jq -r '
+    "user = " + ((.AccessKeyId + ":" + .SecretAccessKey) | @json),
+    (if .SessionToken then
+      "header = " + (("X-Amz-Security-Token: " + .SessionToken) | @json)
+    else empty end)
+  ' |
+  curl --config - --silent --show-error --include \
+    --aws-sigv4 'aws:amz:us-east-1:execute-api' \
+    --header 'Content-Type: application/json' \
+    --data '{"bucket":"ccmp200-arijit-originals-01","key":"sample.jpg"}' \
+    'https://5e4gedtlg4.execute-api.us-east-1.amazonaws.com/dev/resize'
+```
+
+Look for HTTP 200 and an `executionArn` in the response body. Open that execution in Step Functions and check that it says **Succeeded**. In the thumbnails bucket, check for `thumbnails/sample.jpg`.
 
 ## 4. Process uploads automatically
 
